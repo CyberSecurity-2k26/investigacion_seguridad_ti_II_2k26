@@ -1,0 +1,3 @@
+# El servidor no requiere dependencias externas: usa solo stdlib.
+# Se deja python-dotenv como opcional por si se prefiere su parser.
+# python-dotenv==1.0.1
