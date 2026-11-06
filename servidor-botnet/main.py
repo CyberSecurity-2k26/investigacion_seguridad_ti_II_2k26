@@ -42,23 +42,17 @@ from typing import Dict, List, Optional
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config" / ".env"
 
-CONFIG_DEFECTO = {
-    "BOT_HOST": "0.0.0.0",
-    "BOT_PORT": "4024",
-    "BACKLOG": "128",
-    "MAX_ZOMBIES": "18",
-    "HANDSHAKE_TIMEOUT": "15",
-    "HEARTBEAT_TIMEOUT": "90",
-    "SOCKET_TIMEOUT": "5",
-    "MONITOR_INTERVAL": "5",
-    "LOG_DIR": "logs",
-    "METRICS_DIR": "metrics",
-    "VICTIM_HOST": "203.0.113.10",
-    "VICTIM_PORT": "80",
-    "FLOOD_THREADS": "50",
-    "FLOOD_DURATION": "30",
-    "FLOOD_METHOD": "GET",
-}
+CLAVES_OBLIGATORIAS = (
+    "BOT_HOST", "BOT_PORT", "BACKLOG", "MAX_ZOMBIES",
+    "HANDSHAKE_TIMEOUT", "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT",
+    "MONITOR_INTERVAL", "LOG_DIR", "METRICS_DIR",
+    "VICTIM_HOST", "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION", "FLOOD_METHOD",
+)
+CLAVES_ENTERAS = (
+    "BOT_PORT", "BACKLOG", "MAX_ZOMBIES", "HANDSHAKE_TIMEOUT",
+    "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT", "MONITOR_INTERVAL",
+    "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION",
+)
 
 
 # ------------------------------------------------------------------ #
@@ -66,23 +60,34 @@ CONFIG_DEFECTO = {
 # ------------------------------------------------------------------ #
 
 def cargar_config() -> dict:
-    cfg = dict(CONFIG_DEFECTO)
-    if CONFIG_FILE.exists():
-        for linea in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
-            linea = linea.strip()
-            if not linea or linea.startswith("#") or "=" not in linea:
-                continue
-            clave, valor = linea.split("=", 1)
-            clave = clave.strip()
-            if clave in cfg:
-                cfg[clave] = valor.strip().strip('"').strip("'")
-    for clave in cfg:                      # las variables de entorno mandan
-        if clave in os.environ:
-            cfg[clave] = os.environ[clave]
-    for clave in ("BOT_PORT", "BACKLOG", "MAX_ZOMBIES", "HANDSHAKE_TIMEOUT",
-                  "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT", "MONITOR_INTERVAL",
-                  "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION"):
-        cfg[clave] = int(cfg[clave])
+    """Lee config/.env. Es la única fuente de configuración."""
+    if not CONFIG_FILE.exists():
+        sys.exit("ERROR: falta el archivo de configuración {}".format(CONFIG_FILE))
+
+    cfg = {}
+    for numero, linea in enumerate(CONFIG_FILE.read_text(encoding="utf-8").splitlines(), 1):
+        linea = linea.strip()
+        if not linea or linea.startswith("#"):
+            continue
+        if "=" not in linea:
+            sys.exit("ERROR: línea {} mal formada en config/.env: {}".format(numero, linea))
+        clave, valor = linea.split("=", 1)
+        cfg[clave.strip()] = valor.strip().strip('"').strip("'")
+
+    faltantes = [c for c in CLAVES_OBLIGATORIAS if not cfg.get(c)]
+    if faltantes:
+        sys.exit("ERROR: faltan claves en config/.env: {}".format(", ".join(faltantes)))
+
+    for clave in CLAVES_ENTERAS:
+        try:
+            cfg[clave] = int(cfg[clave])
+        except ValueError:
+            sys.exit("ERROR: '{}' debe ser un número entero en config/.env".format(clave))
+
+    if cfg["FLOOD_METHOD"].upper() not in ("GET", "POST"):
+        sys.exit("ERROR: FLOOD_METHOD solo admite GET o POST")
+    cfg["FLOOD_METHOD"] = cfg["FLOOD_METHOD"].upper()
+
     cfg["LOG_DIR"] = str(BASE_DIR / cfg["LOG_DIR"])
     cfg["METRICS_DIR"] = str(BASE_DIR / cfg["METRICS_DIR"])
     return cfg
