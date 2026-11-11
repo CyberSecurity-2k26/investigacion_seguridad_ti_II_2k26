@@ -30,7 +30,7 @@ import uuid
 # Parámetros (sobreescribibles con config.ini junto al ejecutable)
 # ------------------------------------------------------------------ #
 
-SERVER_HOST = "3.82.52.200"
+SERVER_HOST = "54.80.230.134"
 SERVER_PORT = 4024
 HEARTBEAT_INTERVAL = 20.0
 RECV_TIMEOUT = 5.0
