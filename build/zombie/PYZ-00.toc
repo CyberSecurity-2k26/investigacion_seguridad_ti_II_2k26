@@ -1,4 +1,4 @@
-('D:\\Universidad_UTN\\2026\\Tercer_Cuatri\\Seguridad\\Investigacion\\investigacion_seguridad_ti_II_2k26\\build\\zombie\\PYZ-00.pyz',
+('C:\\UTN\\2026\\TercerCuatri\\ciberseguridad\\investigacion_seguridad_ti_II_2k26\\build\\zombie\\PYZ-00.pyz',
  [('__future__',
    'C:\\Users\\esteb\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\__future__.py',
    'PYMODULE'),
